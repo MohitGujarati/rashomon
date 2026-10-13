@@ -32,8 +32,21 @@ type Nono struct {
 	Reason   string `json:"reason,omitempty"`
 	// Allowed and Denied are the distinct hosts, kept apart because a denied
 	// host is one the agent TRIED to reach and did not.
+	//
+	// Neither holds the client's own traffic: see ClientPlaneAllowed.
 	Allowed []string `json:"allowed"`
 	Denied  []string `json:"denied"`
+	// ClientPlaneAllowed and ClientPlaneDenied are the client's own traffic in
+	// the trail -- Claude Code's model API and telemetry -- kept out of the two
+	// lists above. Measured inside nono 0.79 with no proxy store, which is the
+	// default path: api.anthropic.com was counted as an allowed host of the
+	// session, and the client's log upload was listed as "refused by the
+	// sandbox", an attempt the agent never made. Named rather than dropped, so a
+	// reader can still see what the sandbox did with them -- and split by
+	// decision for that reason: one list of both said a host was there and not
+	// whether the sandbox let it through.
+	ClientPlaneAllowed []string `json:"client_plane_allowed"`
+	ClientPlaneDenied  []string `json:"client_plane_denied"`
 	// SawWhatTheProxyDidNot is the interesting column. A host here reached the
 	// network with the sandbox watching and left no row on the proxy's wire.
 	//
@@ -82,13 +95,15 @@ type Nono struct {
 // observation, for the same reason the chain links are: that view has already
 // had forgotten hosts suppressed, and a second consumer reading around it is
 // how a suppressed host returns in a different section under a different name.
-func buildNono(obs nono.Observation, dests Destinations, configured bool, forgotten func(string) bool) Nono {
+func buildNono(obs nono.Observation, dests Destinations, configured, mcpAttributed bool, declared map[string]bool, forgotten func(string) bool) Nono {
 	n := Nono{
 		Configured:            configured,
 		Observed:              obs.Observed,
 		Reason:                obs.Reason,
 		Allowed:               []string{},
 		Denied:                []string{},
+		ClientPlaneAllowed:    []string{},
+		ClientPlaneDenied:     []string{},
 		SawWhatTheProxyDidNot: []string{},
 		PlainHTTP:             []string{},
 		ProxySawWhatItDidNot:  []string{},
@@ -111,8 +126,37 @@ func buildNono(obs nono.Observation, dests Destinations, configured bool, forgot
 	// "seen by the sandbox and not on the wire". Forgetting PROMOTED it.
 	obs = suppressTrail(obs, forgotten)
 
-	n.Allowed = obs.Hosts()
-	n.Denied = obs.Denied()
+	// THE CLIENT'S OWN TRAFFIC, set apart before anything counts it. The
+	// reconciliation below always excluded it, but only once a proxy store was
+	// read; on the default path it returned at the wire guard with the client's
+	// hosts already in Allowed and Denied. The rule is clientPlaneHost, the one
+	// the destinations view applies, so the MCP transport stays the agent's on
+	// a session that made mcp__* calls.
+	//
+	// EXCEPT A HOST A TOOL CALL NAMED. The list says which hosts the client
+	// contacts on its own; it cannot say a session's attempt on one is the
+	// client's. A trail event carries no caller, so when the session's own
+	// call named the host the attempt stays in the agent's columns. Filed as
+	// the client's, a refused `curl` to the Datadog log intake -- a shared
+	// endpoint that takes posts under any account's key -- left "refused by
+	// the sandbox" and was named as traffic the agent did not make.
+	clientPlane := func(h string) bool { return clientPlaneHost(h, mcpAttributed) }
+	clientsOwn := func(h string) bool { return clientPlane(h) && !declared[h] }
+	// Split per decision, from lists the trail already sorted, so both halves
+	// keep that order without a map between them.
+	split := func(hosts []string) (agent, client []string) {
+		agent, client = []string{}, []string{}
+		for _, h := range hosts {
+			if clientsOwn(h) {
+				client = append(client, h)
+				continue
+			}
+			agent = append(agent, h)
+		}
+		return agent, client
+	}
+	n.Allowed, n.ClientPlaneAllowed = split(obs.Hosts())
+	n.Denied, n.ClientPlaneDenied = split(obs.Denied())
 
 	// COUNTED ABOVE THE WIRE GUARD. This sat below it, so on the default path
 	// -- no proxy store, which is most users -- an unknown decision was
@@ -155,27 +199,31 @@ func buildNono(obs nono.Observation, dests Destinations, configured bool, forgot
 	// was reported as traffic the proxy missed -- which on a real session fires
 	// every time, because api.anthropic.com is the client's own model traffic.
 	//
-	// The client-plane test reads the VIEW'S OWN LIST, not clientPlaneHosts. That
-	// is a rule chains.go states by name: the two differ for
-	// mcp-proxy.anthropic.com, which belongs to the agent on a session that made
-	// mcp__* calls. I wrote that rule and broke it two files later.
-	clientPlane := map[string]bool{}
-	for _, h := range dests.ClientPlane {
-		clientPlane[h] = true
-	}
-	excluded := func(h string) bool { return loopbackHosts[h] || clientPlane[h] }
+	// The client-plane test is clientPlaneHost, NOT clientPlaneHosts. That is a
+	// rule chains.go states by name: the two differ for mcp-proxy.anthropic.com,
+	// which belongs to the agent on a session that made mcp__* calls. I wrote
+	// that rule and broke it two files later. It used to read the view's own
+	// list, which says the same for every host on the wire and nothing for a
+	// client host only the trail holds.
+	excluded := func(h string) bool { return loopbackHosts[h] || clientPlane(h) }
 
 	onWire := map[string]bool{}
 	wireReached := map[string]bool{}
 	for _, h := range dests.Hosts {
-		if h.Inherited || excluded(h.Host) {
+		if h.Inherited {
+			continue
+		}
+		// Whether the WIRE saw a connection, as against a refused attempt.
+		// Kept for the client's plane too, which the columns below leave out:
+		// the escape check reads it, and an escape is one whoever sent it.
+		// Loopback is a finding on neither side, this one included.
+		if !h.Unreached && !loopbackHosts[h.Host] {
+			wireReached[h.Host] = true
+		}
+		if excluded(h.Host) {
 			continue
 		}
 		onWire[h.Host] = true
-		// Whether the WIRE saw a connection, as against a refused attempt.
-		if !h.Unreached {
-			wireReached[h.Host] = true
-		}
 	}
 
 	// Two transports per host, tracked apart. The first version ORed
@@ -188,6 +236,7 @@ func buildNono(obs nono.Observation, dests Destinations, configured bool, forgot
 	observable := map[string]bool{}
 	inTrail := map[string]bool{}
 	denied := map[string]bool{}
+	trailAllowed := map[string]bool{}
 	for _, e := range obs.Events {
 		if e.Decision == nono.DecisionDeny {
 			denied[e.Host] = true
@@ -198,6 +247,9 @@ func buildNono(obs nono.Observation, dests Destinations, configured bool, forgot
 			// number does not double when a proxy store is present.
 			continue
 		}
+		// Every host the sandbox allowed, the excluded ones included: the
+		// escape check below asks it of the client's plane as well.
+		trailAllowed[e.Host] = true
 		if excluded(e.Host) {
 			// The same filter as the wire side. Counted as nothing: loopback and
 			// the client's own plane are findings on neither.
@@ -237,16 +289,26 @@ func buildNono(obs nono.Observation, dests Destinations, configured bool, forgot
 			continue
 		}
 		if denied[h] {
-			// THE STRONGEST FINDING A FOURTH SOURCE CAN PRODUCE, and the first
-			// version cancelled it. A denial agrees with the wire only when the
-			// wire also shows the host was never reached; if the proxy recorded a
-			// connection, the traffic ESCAPED the sandbox.
-			if wireReached[h] {
-				n.DeniedButReached = append(n.DeniedButReached, h)
-			}
+			// Not missing from the trail: refused in it. Whether it then
+			// escaped is the check below.
 			continue
 		}
 		n.ProxySawWhatItDidNot = append(n.ProxySawWhatItDidNot, h)
+	}
+	// THE STRONGEST FINDING A FOURTH SOURCE CAN PRODUCE, and the first version
+	// cancelled it. A denial agrees with the wire only when the wire also shows
+	// the host was never reached; if the proxy recorded a connection and the
+	// sandbox allowed the host nowhere, the traffic ESCAPED the sandbox.
+	//
+	// Read over every refused host, the CLIENT'S PLANE INCLUDED. It used to run
+	// over the reconciliation's own hosts, which leave the client's plane out,
+	// so each host added to that list -- the Datadog log intake was -- silently
+	// lost this line. Who sent the traffic does not change what the two
+	// sources say together: the sandbox refused it and it went out anyway.
+	for h := range denied {
+		if wireReached[h] && !trailAllowed[h] {
+			n.DeniedButReached = append(n.DeniedButReached, h)
+		}
 	}
 	sort.Strings(n.PlainHTTP)
 	sort.Strings(n.DeniedButReached)

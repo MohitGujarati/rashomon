@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/altrace-dev-role/rashomon/internal/host"
 )
 
 // evictGrace keeps a run that was written to recently out of eviction. The
@@ -425,6 +427,15 @@ func rewriteAt(path string, lines [][]byte) error {
 	return rewrite(f, lines)
 }
 
+// canonicalHost is host.Canonical, under a name ForgetHost's parameter does
+// not shadow.
+func canonicalHost(raw string) (string, bool) { return host.Canonical(raw) }
+
+// ErrNotAHostname is ForgetHost's refusal of a value that names no host: a
+// path, a credential, whitespace inside, or nothing left once a scheme and a
+// port are removed. It does not carry the value, which may hold a credential.
+var ErrNotAHostname = errors.New("store: forget --host: the value is not a hostname")
+
 // declHead is what a host-scoped forget needs from a record: the join key and
 // the hostnames a declaration named.
 type declHead struct {
@@ -455,12 +466,35 @@ type declHead struct {
 // deleting from it would break the chain it exists to provide. The gap record
 // carries the host so the report keeps the destination suppressed from its
 // view instead, and says so rather than implying the row is gone.
+//
+// THE NAME IS CANONICALISED FIRST, by host.Canonical, the function every host
+// this store and the report hold has been through: the declarations' lists,
+// the proxy's rows and the sandbox's trail. Matched and digested as typed,
+// "GitHub.com", "github.com:443" and "https://github.com/" each named a host
+// nothing held, so the forget removed nothing and suppressed nothing while
+// the command said later reports would leave it out. A value Canonical
+// refuses names no destination at all and is refused here, before anything is
+// written.
 func (s *Store) ForgetHost(host string, now time.Time) ([]Gap, error) {
 	if host == "" {
 		return nil, errors.New("store: forget --host needs a host")
 	}
+	host, ok := canonicalHost(host)
+	if !ok {
+		return nil, ErrNotAHostname
+	}
 	names, err := s.Runs()
 	if err != nil {
+		return nil, err
+	}
+	// The store-level record lands FIRST and ALWAYS, removed records or not.
+	// First, for the reason the gaps land before their rewrites: a failure
+	// after it overstates the forget, which a reader can see, rather than
+	// leaving a host suppressed nowhere. Always, because the report reads
+	// sources this store never held -- the sandbox's trail and the proxy's
+	// store -- and a forget that wrote nothing when it removed nothing left
+	// the host listed there (#45).
+	if err := s.recordForgottenHost(s.HostDigest(host), now); err != nil {
 		return nil, err
 	}
 	var gaps []Gap
@@ -474,6 +508,52 @@ func (s *Store) ForgetHost(host string, now time.Time) ([]Gap, error) {
 		}
 	}
 	return gaps, nil
+}
+
+// recordForgottenHost appends the store-level forget record for a digest,
+// unless the file already holds one for it.
+//
+// ONCE, checked under the file's lock: every forget --host used to append a
+// line, so forgetting the same host again wrote a second record that says
+// nothing the first did not, to a file no size cap covers (Evict counts runs/
+// only, and a window forget never touches it). The check reads the file it
+// is about to append to, under the lock a concurrent forget would take, so
+// two forgets of one host cannot both find it absent.
+func (s *Store) recordForgottenHost(digest string, now time.Time) error {
+	line, err := marshalLine(ForgottenHostRecord{
+		Type:          TypeForgottenHost,
+		SchemaVersion: SessionSchemaVersion,
+		RecordedAtMS:  now.UnixMilli(),
+		HostDigest:    digest,
+	})
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(s.root, FileForgottenHosts), appendFlags, fileMode)
+	if err != nil {
+		return err
+	}
+	defer f.Close() //nolint:errcheck // Sync below reports the write failure
+	unlock, err := lockFile(f, lockBudget)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	held, err := readLines(f)
+	if err != nil {
+		return err
+	}
+	for _, l := range held {
+		var r ForgottenHostRecord
+		if json.Unmarshal(l, &r) == nil && r.Type == TypeForgottenHost && r.HostDigest == digest {
+			return nil
+		}
+	}
+	if _, err := f.Write(line); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func (s *Store) forgetHostInRun(dir, host string, now time.Time) (*Gap, error) {
@@ -614,7 +694,11 @@ func (s *Store) HostDigest(host string) string {
 }
 
 // ForgottenHost reports whether a host has been removed by a host-scoped
-// forget, by recomputing its keyed digest and looking for it among the gaps.
+// forget, by recomputing its keyed digest and looking for it among the gaps
+// and the store-level forget records.
+//
+// BOTH SOURCES. The store-level records cover every forget since they
+// existed; the gaps cover the forgets made before, which wrote only a gap.
 //
 // Returned as a predicate rather than a set of names because the names are not
 // recoverable: the caller asks about a host it already has, which is exactly
@@ -629,6 +713,15 @@ func (s *Store) ForgottenHost() (func(string) bool, error) {
 		if g.Reason == GapForgetHost && g.HostDigest != "" {
 			digests[g.HostDigest] = true
 		}
+	}
+	err = eachLine(filepath.Join(s.root, FileForgottenHosts), func(line []byte) {
+		var r ForgottenHostRecord
+		if json.Unmarshal(line, &r) == nil && r.Type == TypeForgottenHost && r.HostDigest != "" {
+			digests[r.HostDigest] = true
+		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	if len(digests) == 0 {
 		// A predicate that allocates and hashes nothing on the overwhelmingly

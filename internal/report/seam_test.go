@@ -2,9 +2,11 @@ package report
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -433,10 +435,9 @@ func TestSeam_AForgottenHostDoesNotReturnUnderTheSandboxHeading(t *testing.T) {
 	// suppression is built from those gaps. Without this the forget is a
 	// silent no-op and the test passes for the wrong reason.
 	//
-	// THAT IS ALSO A PRODUCT FINDING, recorded here because the test is where
-	// it was found: a host that appears ONLY in the sandbox's trail and never
-	// in rashomon's own records cannot be forgotten at all. `forget --host`
-	// forgets what rashomon recorded; the fourth evidence source has a hole.
+	// That hole -- a host only the sandbox's trail held could not be forgotten
+	// at all -- was found here and is closed by the store-level forget record
+	// (#45); TestSeam_AHostOnlyTheSandboxSawCanBeForgotten pins it.
 	if err := st.AppendDeclaration(store.Declaration{
 		Type: "declaration", SchemaVersion: 2, SessionID: id,
 		ToolUseID: "toolu_forget", ToolName: "Bash",
@@ -480,6 +481,121 @@ func TestSeam_AForgottenHostDoesNotReturnUnderTheSandboxHeading(t *testing.T) {
 	if !strings.Contains(b.String(), "sandbox (nono):") {
 		t.Fatalf("premise: the sandbox section did not render, so this test proves "+
 			"nothing:\n%s", b.String())
+	}
+}
+
+// TestSeam_AHostOnlyTheSandboxSawCanBeForgotten is #45, in both of the shapes
+// the live nono run produced.
+//
+//	only-trail  no record of rashomon's ever named the host; only the
+//	            sandbox's trail holds it.
+//	same-call   the host WAS named, by a call an earlier forget of another
+//	            host already removed -- so this forget removes nothing either.
+//	            Measured on nono 0.79: forgetting github.com took the call that
+//	            also named example.com, and example.com could then never leave
+//	            the sandbox's allowed list.
+//
+// No proxy store, deliberately: the default path, and the trail is suppressed
+// before the wire guard, so this reaches the code without one.
+func TestSeam_AHostOnlyTheSandboxSawCanBeForgotten(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, st *store.Store, id string, at, now time.Time)
+	}{
+		{"only-trail", func(*testing.T, *store.Store, string, time.Time, time.Time) {}},
+		{"same-call", func(t *testing.T, st *store.Store, id string, at, now time.Time) {
+			if err := st.AppendDeclaration(store.Declaration{
+				Type: "declaration", SchemaVersion: 2, SessionID: id,
+				ToolUseID: "toolu_both", ToolName: "Bash",
+				RecordedAtMS: at.UnixMilli(), Hosts: []string{"github.com", "pypi.org"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.ForgetHost("github.com", now); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			at := firstNonoEvent(t)
+			st, id, now := seamSessionAt(t, at)
+			tc.setup(t, st, id, at, now)
+
+			gaps, err := st.ForgetHost("pypi.org", now)
+			if err != nil {
+				t.Fatalf("forget --host: %v", err)
+			}
+			if len(gaps) != 0 {
+				t.Fatalf("premise: this forget must remove nothing, or the gap path is "+
+					"what suppresses the host; it wrote %d gap(s)", len(gaps))
+			}
+
+			rep, err := Build(st, id, now, WithNonoTrail(nonoFixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var b strings.Builder
+			if err := Text(&b, rep); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(b.String(), "sandbox (nono):") {
+				t.Fatalf("premise: the sandbox section did not render:\n%s", b.String())
+			}
+			// THE COUNT, NOT THE NAME. With no proxy store the text names only
+			// refused hosts, and pypi.org is an allowed one, so a search for
+			// its name passed whether or not the forget worked. The fixture
+			// allows example.com and pypi.org; with pypi.org forgotten the
+			// count is 1.
+			if !strings.Contains(b.String(), "sandbox (nono): 1 allowed,") {
+				t.Errorf("a host forgotten with nothing to remove is still counted under the "+
+					"sandbox heading (#45):\n%s", b.String())
+			}
+			if strings.Contains(b.String(), "pypi.org") {
+				t.Errorf("a host forgotten with nothing to remove is back under the "+
+					"sandbox heading (#45):\n%s", b.String())
+			}
+			for _, s := range rep.Sessions {
+				for _, h := range append(append([]string{}, s.Nono.Allowed...), s.Nono.Denied...) {
+					if h == "pypi.org" {
+						t.Errorf("the JSON still lists the forgotten host: %v / %v",
+							s.Nono.Allowed, s.Nono.Denied)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestSeam_TheMCPTransportReachesTheSandboxSection: whether the session made
+// mcp__* calls is decided from its declarations, and that answer has to reach
+// the sandbox section through Build, or the MCP transport is filed as the
+// client's own traffic on the one kind of session where it is the agent's.
+func TestSeam_TheMCPTransportReachesTheSandboxSection(t *testing.T) {
+	at := firstNonoEvent(t)
+	st, id, now := seamSessionAt(t, at)
+	if err := st.AppendDeclaration(store.Declaration{
+		Type: "declaration", SchemaVersion: 2, SessionID: id,
+		ToolUseID: "toolu_mcp", ToolName: "mcp__docs__search",
+		RecordedAtMS: at.UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	trail := filepath.Join(t.TempDir(), "mcp.ndjson")
+	body := `{"sequence":0,"event":{"type":"session_started"}}` + "\n" +
+		ev(1, at.UnixMilli(), "connect", "allow", mcpProxyHost, 443)
+	if err := os.WriteFile(trail, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Build(st, id, now, WithNonoTrail(trail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Sessions) != 1 || !rep.Sessions[0].Nono.Observed {
+		t.Fatalf("premise: the sandbox section did not observe the trail: %+v", rep.Sessions)
+	}
+	if n := rep.Sessions[0].Nono; strings.Join(n.Allowed, ",") != mcpProxyHost {
+		t.Errorf("on a session that made mcp__* calls the MCP transport is the agent's; "+
+			"allowed %v, client_plane_allowed %v", n.Allowed, n.ClientPlaneAllowed)
 	}
 }
 
@@ -554,4 +670,241 @@ func ev(seq int, ms int64, mode, decision, target string, port int) string {
 		`{"sequence":%d,"event":{"type":"network","event":{"timestamp_unix_ms":%d,`+
 			`"mode":%q,"decision":%q,"target":%q,"port":%d}}}`+"\n",
 		seq, ms, mode, decision, target, port)
+}
+
+// TestSeam_AnySpellingOfAForgottenHostLeavesTheSandboxSection: the trail's
+// hosts are canonical, so a forget has to digest the canonical spelling of
+// whatever the user typed. github.com is the fixture's refused host, which
+// the text names, so the text assertion can fail; pypi.org is an allowed
+// host, which the text only counts, so it is checked in the JSON.
+func TestSeam_AnySpellingOfAForgottenHostLeavesTheSandboxSection(t *testing.T) {
+	for _, c := range []struct{ spelled, canonical string }{
+		{"GitHub.com", "github.com"},
+		{"github.com.", "github.com"},
+		{"https://github.com/", "github.com"},
+		{"github.com:443", "github.com"},
+		{"PyPI.org", "pypi.org"},
+		{"pypi.org:443", "pypi.org"},
+	} {
+		t.Run(c.spelled, func(t *testing.T) {
+			at := firstNonoEvent(t)
+			st, id, now := seamSessionAt(t, at)
+			if _, err := st.ForgetHost(c.spelled, now); err != nil {
+				t.Fatalf("forget --host %q: %v", c.spelled, err)
+			}
+			rep, err := Build(st, id, now, WithNonoTrail(nonoFixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var b strings.Builder
+			if err := Text(&b, rep); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(b.String(), "sandbox (nono):") {
+				t.Fatalf("premise: the sandbox section did not render:\n%s", b.String())
+			}
+			if strings.Contains(b.String(), c.canonical) {
+				t.Errorf("forget --host %q left %s in the report:\n%s", c.spelled, c.canonical, b.String())
+			}
+			n := rep.Sessions[0].Nono
+			if slices.Contains(n.Allowed, c.canonical) || slices.Contains(n.Denied, c.canonical) {
+				t.Errorf("forget --host %q: the sandbox still lists %s: allowed %v, denied %v",
+					c.spelled, c.canonical, n.Allowed, n.Denied)
+			}
+		})
+	}
+}
+
+// trailOf writes a nono trail holding one connect event per host and
+// decision, all at one instant, and returns its path.
+func trailOf(t *testing.T, at time.Time, events ...[2]string) string {
+	t.Helper()
+	body := `{"sequence":0,"event":{"type":"session_started"}}` + "\n"
+	for i, e := range events {
+		body += ev(i+1, at.UnixMilli(), "connect", e[1], e[0], 443)
+	}
+	path := filepath.Join(t.TempDir(), "trail.ndjson")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestSeam_AClientPlaneHostAToolCallNamedIsTheAgents: the client-plane list
+// says which hosts the CLIENT contacts on its own, and a tool call naming one
+// is the agent's attempt, not the client's. With the list applied to the
+// sandbox section alone, a refused `curl` to the Datadog log intake -- a
+// shared endpoint that takes posts under any account's key, the kind of place
+// data leaves through -- vanished from "refused by the sandbox" and was named
+// as the client's own traffic, the agent's attempt relabelled as not its own.
+func TestSeam_AClientPlaneHostAToolCallNamedIsTheAgents(t *testing.T) {
+	for _, h := range []string{"http-intake.logs.us5.datadoghq.com", "sentry.io", "api.anthropic.com"} {
+		for _, decision := range []string{"deny", "allow"} {
+			t.Run(h+"/"+decision, func(t *testing.T) {
+				at := firstNonoEvent(t)
+				st, id, now := seamSessionAt(t, at)
+				if err := st.AppendDeclaration(store.Declaration{
+					Type: "declaration", SchemaVersion: 2, SessionID: id,
+					ToolUseID: "toolu_curl", ToolName: "Bash",
+					RecordedAtMS: at.UnixMilli(), Hosts: []string{h},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				rep, err := Build(st, id, now, WithNonoTrail(trailOf(t, at, [2]string{h, decision})))
+				if err != nil {
+					t.Fatal(err)
+				}
+				n := rep.Sessions[0].Nono
+				column, want := n.Allowed, "sandbox (nono): 1 allowed, 0 denied"
+				if decision == "deny" {
+					column, want = n.Denied, "    refused by the sandbox: "+h+"\n"
+				}
+				if strings.Join(column, ",") != h {
+					t.Errorf("the sandbox's %s of %s, a host a tool call named, is not in the "+
+						"agent's column: allowed %v, denied %v", decision, h, n.Allowed, n.Denied)
+				}
+				var b strings.Builder
+				if err := Text(&b, rep); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(b.String(), want) {
+					t.Errorf("want %q in:\n%s", want, b.String())
+				}
+				if strings.Contains(b.String(), "the client's own traffic") {
+					t.Errorf("the agent's own attempt is named as the client's traffic:\n%s", b.String())
+				}
+			})
+		}
+	}
+}
+
+// TestSeam_ARefusedClientHostReachedOnTheWireIsAnEscape: "refused by the
+// sandbox and reached anyway" says the sandbox leaked, and who sent the
+// traffic does not change that. The escape check read only hosts the
+// reconciliation kept, which drops the client's plane, so adding the Datadog
+// intake to that list silenced the loudest line in the section for it. The
+// rule for any host is kept: an escape needs the sandbox to have refused the
+// host and allowed it nowhere, and the wire to have reached it.
+func TestSeam_ARefusedClientHostReachedOnTheWireIsAnEscape(t *testing.T) {
+	const intake = "http-intake.logs.us5.datadoghq.com"
+	for _, c := range []struct {
+		name   string
+		events [][2]string
+		want   string
+	}{
+		{"refused only", [][2]string{{intake, "deny"}, {"pypi.org", "allow"}}, intake},
+		{"also allowed", [][2]string{{intake, "deny"}, {intake, "allow"}, {"pypi.org", "allow"}}, ""},
+		// Loopback is a finding on neither side, an escape included.
+		{"loopback", [][2]string{{"localhost", "deny"}, {"pypi.org", "allow"}}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			at := firstNonoEvent(t)
+			st, id, now := seamSessionAt(t, at)
+			db := seamStore(t, [][4]string{{"r1", "", intake, ""}, {"r2", "", "pypi.org", ""}, {"r3", "", "localhost", ""}}, at)
+			rep, err := Build(st, id, now, WithNonoTrail(trailOf(t, at, c.events...)), WithProxyStore(db))
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := rep.Sessions[0].Nono
+			if got := strings.Join(n.DeniedButReached, ","); got != c.want {
+				t.Errorf("denied_but_reached = %q, want %q", got, c.want)
+			}
+			var b strings.Builder
+			if err := Text(&b, rep); err != nil {
+				t.Fatal(err)
+			}
+			escaped := strings.Contains(b.String(), "REFUSED BY THE SANDBOX AND REACHED ANYWAY: "+intake)
+			if escaped != (c.want != "") {
+				t.Errorf("escape line shown = %v, want %v:\n%s", escaped, c.want != "", b.String())
+			}
+		})
+	}
+}
+
+// TestSeam_TheClientsOwnTrafficSaysWhatTheSandboxDid: the client-traffic line
+// is there so a reader comparing against nono's own log finds every host, and
+// a host without its decision is half of that. One list fed from both the
+// allowed and the refused hosts rendered a refused log upload -- the very
+// case the line was added for -- under "1 allowed, 0 denied" with nothing to
+// say it was refused. The JSON is split the same way.
+func TestSeam_TheClientsOwnTrafficSaysWhatTheSandboxDid(t *testing.T) {
+	const intake = "http-intake.logs.us5.datadoghq.com"
+	at := firstNonoEvent(t)
+	st, id, now := seamSessionAt(t, at)
+	rep, err := Build(st, id, now, WithNonoTrail(trailOf(t, at,
+		[2]string{"api.anthropic.com", "allow"}, [2]string{intake, "deny"},
+		[2]string{"pypi.org", "allow"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	if err := Text(&b, rep); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"sandbox (nono): 1 allowed, 0 denied in this session's window\n",
+		"    the client's own traffic, not counted above: allowed api.anthropic.com; refused " + intake + "\n",
+	} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("want %q in:\n%s", want, b.String())
+		}
+	}
+	got := nonoJSON(t, rep)
+	if a, d := got["client_plane_allowed"], got["client_plane_denied"]; fmt.Sprint(a) != "[api.anthropic.com]" || fmt.Sprint(d) != "["+intake+"]" {
+		t.Errorf("client_plane_allowed = %v, client_plane_denied = %v; want each decision in its own list", a, d)
+	}
+	if _, merged := got["client_plane"]; merged {
+		t.Errorf("the JSON still carries one client_plane list with no decision: %v", got["client_plane"])
+	}
+}
+
+// TestSeam_TheClientsOwnTrafficIsListedInOrder: every client host, met in
+// reverse order in the trail, comes out sorted, run after run. The list used
+// to be collected from a map, and only a sort made it deterministic; a test
+// with two hosts caught that sort's removal by luck. Each event is a
+// millisecond later than the one before, so the trail reader's own ordering
+// (by time, then host) keeps them reversed, and only the sort can put them
+// back.
+func TestSeam_TheClientsOwnTrafficIsListedInOrder(t *testing.T) {
+	var hosts []string
+	for h := range clientPlaneHosts {
+		hosts = append(hosts, h)
+	}
+	slices.Sort(hosts)
+	want := fmt.Sprint(hosts)
+	slices.Reverse(hosts)
+	at := firstNonoEvent(t)
+	st, id, now := seamSessionAt(t, at)
+	body := `{"sequence":0,"event":{"type":"session_started"}}` + "\n"
+	for i, h := range hosts {
+		body += ev(i+1, at.UnixMilli()+int64(i), "connect", "allow", h, 443)
+	}
+	trail := filepath.Join(t.TempDir(), "trail.ndjson")
+	if err := os.WriteFile(trail, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		rep, err := Build(st, id, now, WithNonoTrail(trail))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprint(nonoJSON(t, rep)["client_plane_allowed"]); got != want {
+			t.Fatalf("run %d: client_plane_allowed = %s, want %s", i, got, want)
+		}
+	}
+}
+
+// nonoJSON is the sandbox section of the first session as its JSON reader
+// sees it.
+func nonoJSON(t *testing.T, rep *Report) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(rep.Sessions[0].Nono)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
